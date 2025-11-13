@@ -5,12 +5,13 @@ from __future__ import annotations
 import os
 import re
 import html
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Sequence, Tuple, List
 from tempfile import NamedTemporaryFile
 
 import requests
 import xml.etree.ElementTree as ET
 from io import StringIO
+import warnings
 
 # Optional langchain-community imports (graceful fallback when not installed)
 try:
@@ -31,150 +32,205 @@ except Exception:
 
 from goob_ai.types_new import Tool, ToolRegistry
 
+# Silence non-fatal BeautifulSoup parser guessing warnings (third-party lib behavior)
+try:  # pragma: no cover - environment dependent
+    from bs4 import GuessedAtParserWarning  # type: ignore
+    warnings.filterwarnings("ignore", category=GuessedAtParserWarning)
+except Exception:
+    pass
 
-def wiki_search(*, query: str, max_results: int = 10, language: str = "en") -> str:
-    """Wikipedia search; args: query, max_results=10, language.
+def split_into_chunks(
+    texts: Sequence[tuple[str, dict]],
+    chunk_size: int = 800,
+    chunk_overlap: int = 120,
+) -> list[tuple[str, dict]]:
+    """Split (text, metadata) pairs into chunks while preserving metadata.
 
     Args:
-        query: Free-text search query.
-        max_results: Maximum number of results to include (default 10).
-        language: Preferred language (only used in HTTP fallback).
+        texts: A sequence of (text, metadata) tuples.
+        chunk_size: Target size of each chunk (characters).
+        chunk_overlap: Overlap size between adjacent chunks (characters).
 
     Returns:
-        Concatenated document blocks as a string.
+        A list of (chunk_text, metadata) tuples.
     """
-    try:
-        import wikipedia
-        if _HAS_LC_COMMUNITY:
-            try:
-                docs = WikipediaLoader(query=query, load_max_docs=max_results).lazy_load()
-                return "\n\n---\n\n".join(
-                    [
-                        f'<Document source="{d.metadata.get("source", "Wikipedia")}" '
-                        f'page="{d.metadata.get("page", "")}"/>\n{d.page_content}\n</Document>'
-                        for d in docs
-                    ]
-                )
-                
-            except Exception as exc:  # noqa: BLE001
-                return f"error: wikipedia loader failed: {exc}"
-    except ModuleNotFoundError:
-        print("warning: wikipedia package not installed; Install wikipedia with 'pip install wikipedia' for using better wiki search.")
 
-
-    # HTTP fallback
-    lang = (language or "en").strip()
-    if not re.fullmatch(r"[a-zA-Z-]{2,10}", lang):
-        lang = "en"
-    k = max(1, min(int(max_results), 10))
     try:
-        resp = requests.get(
-            f"https://{lang}.wikipedia.org/w/api.php",
-            params={
-                "action": "query",
-                "list": "search",
-                "srsearch": query,
-                "srlimit": k,
-                "utf8": 1,
-                "format": "json",
-            },
-            timeout=20,
+        # Prefer robust splitter when available
+        from langchain_text_splitters import (  # type: ignore
+            RecursiveCharacterTextSplitter,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("query", {}).get("search", [])
-        blocks: list[str] = []
-        for item in results:
-            title = str(item.get("title", ""))
-            pageid = item.get("pageid")
-            snippet_html = item.get("snippet", "")
-            snippet_text = re.sub(r"<[^>]+>", "", snippet_html)
-            snippet_text = html.unescape(snippet_text).strip()
-            page_url = f"https://{lang}.wikipedia.org/?curid={pageid}" if pageid else ""
-            blocks.append(
-                f'<Document source="Wikipedia" title="{title}" url="{page_url}"/>\n'
-                f"{snippet_text}\n</Document>"
-            )
-        return "\n\n---\n\n".join(blocks)
-    except Exception as exc:  # noqa: BLE001
-        return f"error: wikipedia search failed: {exc}"
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=["\n\n", "\n", "。", "！", "？", " "],
+        )
+        out: list[tuple[str, dict]] = []
+        for text, meta in texts:
+            for chunk in splitter.split_text(text or ""):
+                if chunk.strip():
+                    safe_meta = meta if isinstance(meta, dict) else {"source": str(meta)}
+                    out.append((chunk, safe_meta))
+        return out
+    except Exception as exc:
+        print(f"warning: langchain_text_splitters not installed; using minimal fallback: {exc}")
+        # Minimal fallback: simple fixed-length slicing
+        out_fallback: list[tuple[str, dict]] = []
+        step = max(1, chunk_size - chunk_overlap)
+        for text, meta in texts:
+            t = text or ""
+            for i in range(0, len(t), step):
+                chunk = t[i : i + chunk_size]
+                if chunk.strip():
+                    safe_meta = meta if isinstance(meta, dict) else {"source": str(meta)}
+                    out_fallback.append((chunk, safe_meta))
+        return out_fallback
 
 
-def web_search(*, query: str, max_results: int = 10) -> str:
-    """Web search via Tavily; args: query, max_results.
+def _tfidf_prerank(
+    chunks: list[tuple[str, dict]],
+    query: str,
+    top_k: int,
+) -> list[tuple[str, dict, float]]:
+    """Pre-rank chunks using TF-IDF cosine similarity, with lightweight fallback.
+
+    Args:
+        chunks: List of (text, metadata) chunks.
+        query: Query text to score against.
+        top_k: Number of items to keep.
+
+    Returns:
+        List of (text, metadata, score) tuples sorted by score descending.
+    """
+
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
+        from sklearn.metrics.pairwise import cosine_similarity  # type: ignore
+
+        corpus = [c[0] for c in chunks]
+        vec = TfidfVectorizer(max_features=20000)
+        X_corpus = vec.fit_transform(corpus)
+        X_query = vec.transform([query])
+        sims = cosine_similarity(X_query, X_corpus).ravel()
+        ranked = sorted(
+            zip(chunks, sims),
+            key=lambda x: float(x[1]),
+            reverse=True,
+        )[: max(1, int(top_k))]
+        return [(c[0], c[1], float(s)) for c, s in ranked]
+    except Exception as e:
+        print(f"warning: sklearn not installed; using minimal fallback: {e}")
+        # Fallback: token overlap (Jaccard-like)
+        import re as _re
+
+        q_terms = set(_re.findall(r"\w+", (query or "").lower()))
+        scored: list[tuple[str, dict, float]] = []
+        for text, meta in chunks:
+            terms = set(_re.findall(r"\w+", (text or "").lower()))
+            inter = len(q_terms & terms)
+            union = len(q_terms | terms) or 1
+            scored.append((text, meta, inter / union))
+        scored.sort(key=lambda x: float(x[2]), reverse=True)
+        return scored[: max(1, int(top_k))]
+
+
+def _crossencoder_rerank(
+    items: list[tuple[str, dict, float]],
+    query: str,
+    top_n: int,
+) -> list[tuple[str, dict, float]]:
+    """Optionally re-rank using a CrossEncoder; otherwise return top_n from input.
+
+    Args:
+        items: Pre-ranked (text, metadata, score) items.
+        query: Query for pairwise scoring.
+        top_n: Number of items to return after re-ranking.
+
+    Returns:
+        Re-ranked list limited to top_n.
+    """
+
+    try:
+        from sentence_transformers import CrossEncoder  # type: ignore
+
+        model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        pairs = [[query, t] for (t, _m, _s) in items]
+        scores = model.predict(pairs)
+        merged = [
+            (items[i][0], items[i][1], float(scores[i])) for i in range(len(items))
+        ]
+        merged.sort(key=lambda x: float(x[2]), reverse=True)
+        return merged[: max(1, int(top_n))]
+    except Exception as e:
+        print(f"warning: sentence_transformers not installed; using minimal fallback: {e}")
+        return items[: max(1, int(top_n))]
+
+
+def rank_chunks(
+    chunks: list[tuple[str, dict]],
+    query: str,
+    top_k: int = 8,
+    rerank_top_n: int = 4,
+) -> list[tuple[str, dict, float]]:
+    """Rank chunks with TF-IDF preselection and optional CrossEncoder re-ranking.
+
+    Args:
+        chunks: List of (text, metadata) chunks.
+        query: Query text for scoring.
+        top_k: Number of candidates to select in pre-ranking.
+        rerank_top_n: Number of final items to return after re-ranking.
+
+    Returns:
+        List of (text, metadata, score) tuples.
+    """
+
+    pre = _tfidf_prerank(chunks, query, top_k)
+    return _crossencoder_rerank(pre, query, rerank_top_n)
+
+
+def web_search(   
+    *,
+    query: str,
+    max_results: int = 5,
+    ) -> str:
+    """Web search; args: query, max_results. Example: tool: web_search query="llm news" max_results=5
     Args:
         query: Free-text search query of keywords.
-        max_results: Maximum number of results to include (default 10).
-    Requires env ``TAVILY_API_KEY``.
+        max_results: Maximum number of results to include (maximum 5).
     """
+    # normalize max_results which may come as str from tool args
+    try:
+        k = max(1, min(int(max_results), 10))
+    except Exception:
+        k = 5
     if _HAS_TAVILY_TOOL:
         try:
-            tool = TavilySearch(max_results=max_results, include_answer=True, include_images=True)
+            tool = TavilySearch(
+                tavily_api_key=os.environ.get("TAVILY_API_KEY", ""),
+                max_results=k,
+                include_answer=True
+            )
             result = tool.invoke({"query": query})
 
             if isinstance(result, dict):
                 items = result.get("results") or []
-                images = result.get("images") or []
-                follow_ups = result.get("follow_up_questions") or []
                 answer = result.get("answer")
 
                 blocks: list[str] = []
-                for item in items[:max_results]:
+                for item in items[:k]:
                     title = item.get("title", "")
-                    url = item.get("url", item.get("page", ""))
-                    content = (
-                        item.get("content")
-                        or item.get("raw_content")
-                        or item.get("page_content")
-                        or item.get("text")
-                        or ""
-                    )
+                    content = item.get("content")
                     score = item.get("score")
                     score_attr = f' score="{score}"' if score is not None else ""
                     blocks.append(
-                        f'<Document source="tavily" title="{title}" url="{url}"{score_attr}/>'
-                        f"\n{content}\n</Document>"
+                        f'<Document source="tavily" title="{title}"{score_attr}/>\n{str(content or "").strip()}\n</Document>'
                     )
-
                 summary_bits: list[str] = []
                 if answer:
                     summary_bits.append(f"answer: {answer}")
-                if images:
-                    summary_bits.append("images: " + ", ".join(images))
-                if follow_ups:
-                    if isinstance(follow_ups, (list, tuple)):
-                        followups_text = "; ".join(str(q) for q in follow_ups)
-                    else:
-                        followups_text = str(follow_ups)
-                    summary_bits.append(f"follow_up_questions: {followups_text}")
-
                 if summary_bits:
                     blocks.insert(0, "summary:\n" + "\n".join(summary_bits))
-
-                return "\n\n---\n\n".join(blocks)
-            #document说是字典，但暂时保留着
-            if isinstance(result, list):        
-                blocks = []
-                for d in result:
-                    if isinstance(d, dict):
-                        source = d.get("source", "tavily")
-                        page = d.get("page", d.get("url", ""))
-                        content = (
-                            d.get("content")
-                            or d.get("page_content")
-                            or d.get("text")
-                            or ""
-                        )
-                    else:
-                        meta = getattr(d, "metadata", {}) or {}
-                        source = meta.get("source", "tavily")
-                        page = meta.get("page", meta.get("url", ""))
-                        content = getattr(d, "page_content", "") or ""
-                        if not content:
-                            content = str(d)
-                    blocks.append(
-                        f'<Document source="{source}" page="{page}"/>\n{content}\n</Document>'
-                    )
                 return "\n\n---\n\n".join(blocks)
 
             if isinstance(result, str):
@@ -187,7 +243,7 @@ def web_search(*, query: str, max_results: int = 10) -> str:
     api_key = os.environ.get("TAVILY_API_KEY", "").strip()
     if not api_key:
         return "error: missing TAVILY_API_KEY environment variable for Tavily web search"
-    k = max(1, min(int(max_results), 10))
+    # k already computed above
     try:
         resp = requests.post(
             "https://api.tavily.com/search",
@@ -207,16 +263,21 @@ def web_search(*, query: str, max_results: int = 10) -> str:
 
 
 def arxiv_search(*, query: str, max_results: int = 10) -> str:
-    """arXiv search; args: query, max_results.
+    """arXiv search; args: query, max_results. Example: tool: arxiv_search query="diffusion model survey" max_results=5
     Args:
         query: Free-text search query of keywords.
         max_results: Maximum number of results to include (default 10).
     """
+    # normalize max_results which may come as str
+    try:
+        k_loader = max(1, min(int(max_results), 10))
+    except Exception:
+        k_loader = 10
     try:
         import arxiv as _  # type: ignore
         if _HAS_LC_COMMUNITY:
             try:
-                loader = ArxivLoader(query=query, load_max_docs=max_results)
+                loader = ArxivLoader(query=query, load_max_docs=k_loader)
                 # 关键：先把生成器完全消耗为列表，确保所有文档都加载完毕
                 docs_list = list(loader.lazy_load())
                 blocks: list[str] = []
@@ -239,7 +300,7 @@ def arxiv_search(*, query: str, max_results: int = 10) -> str:
         print("warning: arxiv package not installed; Install arxiv with 'pip install -U arxiv pymupdf' for using better arxiv search.")
 
     # Minimal HTTP fallback
-    k = max(1, min(int(max_results), 10))
+    k = k_loader
     try:
         resp = requests.get(
             "http://export.arxiv.org/api/query",
@@ -266,7 +327,7 @@ def arxiv_search(*, query: str, max_results: int = 10) -> str:
             summary_txt = (summary_el.text or "").strip() if summary_el is not None else ""
             published = (published_el.text or "").strip() if published_el is not None else ""
             arxiv_id = (id_el.text or "").strip() if id_el is not None else ""
-                blocks.append(
+            blocks.append(
                 f'<Document source="arXiv" title="{title}" published="{published}" id="{arxiv_id}"/>\n{summary_txt}\n</Document>'
             )
         if not blocks:
@@ -276,8 +337,75 @@ def arxiv_search(*, query: str, max_results: int = 10) -> str:
         return f"error: arxiv search failed: {exc}"
 
 
+
+def wiki_retrieve(
+    *,
+    query: str,
+    max_results: int = 5,
+    top_k: int = 8,
+    rerank_top_n: int = 4,
+    chunk_size: int = 800,
+    chunk_overlap: int = 120,
+) -> str:
+    """Wikipedia retrieve; args: query, max_results. Example: tool: wiki_retrieve query="量子计算 概述" max_results=5
+
+    This tool performs retrieval only and returns standardized context text for
+    downstream LLM answering controlled by the agent graph.
+
+    Args:
+        query: Search query for Wikipedia.
+        max_results: Max number of documents to load before chunking.
+        top_k: Candidate pool size for pre-ranking.
+        rerank_top_n: Number of final contexts to return.
+
+    Returns:
+        A textual payload containing ranked contexts and their sources.
+    """
+
+    # 1) Retrieve
+    try:
+        k_docs = max(1, min(int(max_results), 10))
+    except Exception:
+        k_docs = 5
+    blocks: list[tuple[str, dict]] = []
+    if _HAS_LC_COMMUNITY:
+        docs = WikipediaLoader(query=query, load_max_docs=k_docs).lazy_load()
+        for d in docs:
+            content = d.page_content or ""
+            meta = d.metadata or {} #include source, page, title
+            safe_meta = meta if isinstance(meta, dict) else {"source": str(meta)}
+            if content.strip():
+                blocks.append((content, safe_meta))
+            #print(blocks[0][1].keys())
+    else:
+        raise RuntimeError("langchain_community not available")
+
+
+    # 2) Split
+    chunks = split_into_chunks(blocks, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    if not chunks:
+        return "error: wikipedia retrieve failed: empty chunks"
+
+    # 3) Rank
+    ranked = rank_chunks(chunks, query, top_k=top_k, rerank_top_n=rerank_top_n)
+    if not ranked:
+        return "error: wikipedia retrieve failed: ranking produced no results"
+
+    top_contexts = [(t, m) for (t, m, _s) in ranked]
+
+    # 4) Format
+    lines: list[str] = [f'contexts: top {len(top_contexts)} for query="{query}"']
+    for i, (t, m) in enumerate(top_contexts, start=1):
+        m_dict = m if isinstance(m, dict) else {}
+        fallback_src = m if not isinstance(m, dict) else "Wikipedia"
+        src = str(m_dict.get("source") or m_dict.get("page") or m_dict.get("title") or fallback_src or "Wikipedia").strip()
+        lines.append(f"[{i}] {src}\n{t}\n---")
+
+    return "\n\n".join(lines)
+
+
 def analyze_table(*, csv_text: str) -> str:
-    """Analyze CSV text and summarize; args: csv_text = Raw CSV content as a string (including header row).
+    """Analyze CSV; args: csv_text. Example: tool: analyze_table csv_text="a,b\\n1,2"
 
     Args:
         csv_text: Raw CSV content as a string (including header row).
@@ -307,7 +435,7 @@ def analyze_table(*, csv_text: str) -> str:
 
 
 def analyze_image(*, image_path: str) -> str:
-    """Analyze image metadata and optional OCR; args: image_path.
+    """Analyze image; args: image_path. Example: tool: analyze_image image_path=/path/to.png
 
     Args:
         image_path: Local path to an image file.
@@ -333,6 +461,7 @@ def analyze_image(*, image_path: str) -> str:
 
     try:
         image = Image.open(str(p))
+        print(f"analyze_image: opened image: {p} (format={image.format}, size={image.size}, mode={image.mode})")
         width, height = image.size
         mode = image.mode
         fmt = image.format
@@ -345,22 +474,23 @@ def analyze_image(*, image_path: str) -> str:
 
         # Optional OCR
         try:
-            import pytesseract  # type: ignore
-
-            text = pytesseract.image_to_string(image)
-            if text and text.strip():
-                info.append("ocr:\n" + text.strip())
+            import easyocr
+            reader = easyocr.Reader(['ch_sim','en']) # this needs to run only once to load the model into memory
+            result = reader.readtext(str(p),detail=0)
+            print("analyze_image: OCR result:", result)
+            info.append(f"ocr:{result}")
         except Exception:
+            info.append(f"ocr: (easyocr not installed or OCR failed, exc: {exc})")
             # OCR optional; ignore errors
             pass
-
+        print(info)
         return "\n".join(info)
     except Exception as exc:  # noqa: BLE001
         return f"error: failed to analyze image: {exc}"
 
 
 def analyze_remote_image(*, url: str, timeout: int = 15, max_bytes: int = 5 * 1024 * 1024) -> str:
-    """Download an image from URL and analyze it using ``analyze_image``.
+    """Analyze remote image; args: url, timeout?, max_bytes?. Example: tool: analyze_remote_image url=https://example.com/x.png timeout=15
 
     Args:
         url: HTTP/HTTPS URL pointing to the image resource.
@@ -426,7 +556,7 @@ def analyze_remote_image(*, url: str, timeout: int = 15, max_bytes: int = 5 * 10
 
 
 def analyze_video(*, url: str) -> str:
-    """Summarize YouTube metadata and chapters; args: url.
+    """Analyze video; args: url. Example: tool: analyze_video url=https://www.youtube.com/watch?v=XXXX
 
     Args:
         url: YouTube video URL.
@@ -536,7 +666,7 @@ def analyze_video(*, url: str) -> str:
 
 
 def analyze_video_by_chapter(*, url: str, start: str | int, end: str | int | None = None, subtitle_langs: list[str] | None = None) -> str:
-    """Extract subtitles within a specified time range.
+    """Extract subtitles; args: url, start, end?, subtitle_langs?. Example: tool: analyze_video_by_chapter url=YTB start=00:00 end=05:00
 
     Args:
         url: YouTube video URL.
@@ -716,6 +846,63 @@ def analyze_video_by_chapter(*, url: str, start: str | int, end: str | int | Non
         lines.append(f"subtitles_error: {exc}")
         return "\n".join(lines)
 
+def calculator(*, expression: str) -> str:
+    """Calculator; args: expression. Example: tool: calculator expression=2*(3+4)-5/2
+
+    Args:
+        expression: Expression string like "2*(3+4)-5/2".
+
+    Returns:
+        Result string like "result=..." or an error string starting with "error:".
+    """
+    import ast
+    import math
+
+    bin_ops: dict[type[ast.AST], callable] = {
+        ast.Add: lambda a, b: a + b,
+        ast.Sub: lambda a, b: a - b,
+        ast.Mult: lambda a, b: a * b,
+        ast.Div: lambda a, b: a / b,
+        ast.FloorDiv: lambda a, b: a // b,
+        ast.Mod: lambda a, b: a % b,
+        ast.Pow: lambda a, b: a ** b,
+    }
+    unary_ops: dict[type[ast.AST], callable] = {
+        ast.UAdd: lambda a: +a,
+        ast.USub: lambda a: -a,
+    }
+
+    def _eval(node: ast.AST) -> float:
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return float(node.value)
+            raise ValueError("only numeric constants are allowed")
+        if hasattr(ast, "Num") and isinstance(node, getattr(ast, "Num")):  # type: ignore[attr-defined]
+            return float(getattr(node, "n"))  # type: ignore[attr-defined]
+        if isinstance(node, ast.UnaryOp) and type(node.op) in unary_ops:
+            return float(unary_ops[type(node.op)](_eval(node.operand)))
+        if isinstance(node, ast.BinOp) and type(node.op) in bin_ops:
+            left = _eval(node.left)
+            right = _eval(node.right)
+            return float(bin_ops[type(node.op)](left, right))
+        raise ValueError(f"unsupported node: {type(node).__name__}")
+
+    try:
+        src = (expression or "").strip()
+        if not src:
+            return "error: empty expression"
+        parsed = ast.parse(src, mode="eval")
+        result = _eval(parsed)
+        if math.isfinite(result) and abs(result - int(result)) < 1e-12:
+            return f"result={int(result)}"
+        return f"result={result}"
+    except ZeroDivisionError:
+        return "error: division by zero"
+    except Exception as exc:  # noqa: BLE001
+        return f"error: calculator failed: {exc}"
+
 def default_tools() -> ToolRegistry:
     """Return the default tool registry.
 
@@ -724,7 +911,8 @@ def default_tools() -> ToolRegistry:
     """
 
     registry: Mapping[str, Tool] = {
-        "wiki_search": wiki_search,
+        "wiki_retrieve": wiki_retrieve,
+        "calculator": calculator,
         "web_search": web_search,
         "arxiv_search": arxiv_search,
         "analyze_table": analyze_table,

@@ -1,6 +1,6 @@
 import os
 import sys
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Optional
 # Ensure parent directory is in sys.path for local imports
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.dirname(SCRIPT_DIR))
@@ -33,12 +33,18 @@ DEFAULT_API_URL = "https://agents-course-unit4-scoring.hf.space"
 class BasicAgent:
     def __init__(self, planner: str | PlannerCallable | None = None):
         # build_agent accepts planner callable or None
+        # Provide a sensible default tool attempt limit if not set
+        if not os.environ.get("TOOL_ATTEMPT_LIMIT"):
+            os.environ["TOOL_ATTEMPT_LIMIT"] = "2"
         self.agent = build_agent(planner=planner)
 
-    def __call__(self, question: str) -> str:
+    def __call__(self, question: str, image_paths: Optional[list[str]] = None) -> str:
         messages: list[Message] = [{"role": "user", "content": question}]
+        if image_paths:
+            messages.append({"role": "user", "content": f"image_paths: {', '.join(image_paths)}"})
+        print(f"Invoking agent with question: {question} and images: {image_paths}")
         state: AgentState = {"messages": messages}
-        result = self.agent.invoke(state)
+        result = self.agent.invoke(state, config={"recursion_limit": 50})
         plan = result.get("plan") if isinstance(result, dict) else getattr(result, "plan", None)
         if plan and result.get("tool_call") is None:
             return plan if isinstance(plan, str) else str(plan)
@@ -75,7 +81,7 @@ def run_and_submit_all( profile: gr.OAuthProfile | None) -> tuple[str, pd.DataFr
 
     # 1. Instantiate Agent ( modify this part to create your agent)
     try:
-        agent = BasicAgent()
+        agent = BasicAgent(planner=os.environ.get("PLANNER", "ollama"))
     except Exception as e:
         print(f"Error instantiating agent: {e}")
         return f"Error initializing agent: {e}", None
@@ -174,7 +180,7 @@ def run_and_submit_all( profile: gr.OAuthProfile | None) -> tuple[str, pd.DataFr
         results_df = pd.DataFrame(results_log)
         return status_message, results_df
 
-def run_single_input(sentence: str) -> str:
+def run_single_input(sentence: str, images: Optional[list[str]] = None) -> str:
     """Run the defined BasicAgent on a single user-provided sentence.
 
     Args:
@@ -185,10 +191,10 @@ def run_single_input(sentence: str) -> str:
     """
     try:
         
-        agent = BasicAgent(planner="azure_sdk")
+        agent = BasicAgent(planner="ollama")
         # agent = BasicAgent(planner="ollama")        
         # print(f"Single-input run — input: {sentence}")
-        answer = agent(sentence)
+        answer = agent(sentence, images)
         # print(f"Single-input run — answer: {answer}")
         return answer
     except Exception as e:
@@ -199,14 +205,24 @@ def run_single_input(sentence: str) -> str:
 with gr.Blocks() as demo:
     with gr.Tabs():
         with gr.TabItem("Single Input"):
-            gr.Markdown("## Run Agent on a Single Sentence")
-            single_input = gr.Textbox(label="Enter a sentence", placeholder="Type a sentence to send to the agent...", lines=2)
+            with gr.Row():
+                with gr.Column(scale=4):
+                    gr.Markdown("## Run Agent on a Single Sentence")
+                    single_input = gr.Textbox(label="Enter a sentence", placeholder="Type a sentence to send to the agent...", lines=2)
+                with gr.Column(scale=2):
+                    single_images = gr.File(label="Upload images (optional)", file_count="multiple", type="filepath", file_types=["image"])
+                    preview_gallery = gr.Gallery(label="Preview uploaded images", columns=3, height=220)
+            def _files_to_gallery(files):
+                # files will be a list of local file paths when type="filepath"
+                return files or []
+
+            single_images.change(fn=_files_to_gallery, inputs=[single_images], outputs=[preview_gallery])
             single_run = gr.Button("Run Agent")
             single_output = gr.Textbox(label="Agent Response (also printed to server console)", lines=4, interactive=False)
-
+            
             single_run.click(
                 fn=run_single_input,
-                inputs=[single_input],
+                inputs=[single_input, single_images],
                 outputs=[single_output]
             )
         with gr.TabItem("Full Evaluation & Submission"):

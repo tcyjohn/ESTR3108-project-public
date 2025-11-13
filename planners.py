@@ -8,13 +8,12 @@ from __future__ import annotations
 
 import os
 from typing import Callable, List
-import copy
 from ollama import Client
 
 import requests
 from goob_ai.nodes import simple_actor, simple_router
 from langgraph.graph import END, StateGraph
-from goob_ai.types_new import AgentState, Message
+from goob_ai.types_new import AgentState, Message, PlanStep
 from goob_ai.toolkit import default_tools
 
 def simple_planner(state: AgentState) -> AgentState:
@@ -75,14 +74,25 @@ def _parse_plan_and_tool(output: str) -> tuple[str, dict | None]:
         return plan, None
 
     rhs = tool_line.split(":", 1)[1].strip()
+    # Remove the "args=" prefix if present anywhere before parsing.
+    if "args=" in rhs:
+        rhs = rhs.replace("args=", "", 1).strip()
     if not rhs or rhs.lower().startswith("none"):
         return plan, None
     try:
         import shlex
-        parts = shlex.split(rhs)
+        import platform
+
+        if platform.system()=='Windows':
+            def arg_split(args, platform=os.name):
+                return [a[1:-1].replace('""', '"') if a[0] == a[-1] == '"' else a
+                        for a in (shlex.split(args, posix=False) if platform == 'nt' else shlex.split(args))]
+            parts = arg_split(rhs)
+        else:
+            parts = shlex.split(rhs)
     except Exception:
         parts = [p.strip() for p in rhs.replace(",", " ").split() if p.strip()]
-    
+        
     if not parts:
         return plan, None
     
@@ -93,14 +103,15 @@ def _parse_plan_and_tool(output: str) -> tuple[str, dict | None]:
         if "=" in token:
             k, v = token.split("=", 1)
             k = k.lstrip("[(")
-            # 去除可能的尾随标点
             last_k = k
-            v = v.rstrip(",;)]")
-            args[k.strip()] = v.strip()
+            # Only strip quotes and commas/semicolons, NOT parentheses (needed for expressions)
+            v = v.strip().strip("\"'").rstrip(",;")
+            args[k.strip()] = v
         else:  
             if last_k:
-                v = token.rstrip(",;)]")
-                args[last_k] = args.get(last_k, "") + " " + v.strip()
+                # Only strip quotes and commas/semicolons, NOT parentheses
+                v = token.strip().strip("\"'").rstrip(",;")
+                args[last_k] = args.get(last_k, "") + " " + v
     return plan, {"name": name, "args": args}
 
 
@@ -119,9 +130,9 @@ def ollama_planner(state: AgentState) -> AgentState:
     """
 
     host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
-    model = os.environ.get("OLLAMA_MODEL", "deepseek-r1:8b")
+    #model = os.environ.get("OLLAMA_MODEL", "deepseek-r1:8b")
     # host = os.environ.get("OLLAMA_HOST", "").rstrip("/")
-    # model = os.environ.get("OLLAMA_MODEL", "deepseek-v3.1:671b-cloud")
+    model = os.environ.get("OLLAMA_MODEL", "deepseek-v3.1:671b-cloud")
     print(host, model)
     messages = state.get("messages", [])
     user_context = _build_supervised_prompt(messages)
@@ -130,22 +141,64 @@ def ollama_planner(state: AgentState) -> AgentState:
     docs = state.get("tool_docs", {}) or {}
     docs_items = [f"- {k}: {v}".strip() for k, v in sorted(docs.items()) if k in tools and v]
     docs_block = "\n".join(docs_items) if docs_items else ""
+
+    # Known facts accumulated by assessor (if any)
+    facts_text = state.get("facts_text") or ""
+    facts_block = f"Known facts: {facts_text}\n" if facts_text else ""
+    # recent action context to discourage repetition
+    last_name = state.get("last_tool") or ""
+    last_args = state.get("last_tool_args") or {}
+    last_obs = (state.get("last_observation") or "")[:600]
+    attempts = state.get("tool_attempts") or {}
+    last_attempts = int(attempts.get(last_name, 0)) if last_name else 0
+
+    # Build recent actions block (last up to 3 actions for continuity)
+    recent_block = ""
+    try:
+        history = state.get("action_history") or []
+        if history:
+            tail = history[-3:]
+            lines = ["Recent actions:"]
+            for i, rec in enumerate(tail, start=max(1, len(history)-len(tail)+1)):
+                t = rec.get("tool", "")
+                a = rec.get("args", {})
+                o = (rec.get("observation", "") or "")[:280]
+                lines.append(f"- #{i}: tool={t} args={a} obs={o}")
+            lines.append("Guidance: Do NOT restart completed subgoals; build on these observations. If unhelpful, choose a different tool.")
+            recent_block = "\n".join(lines) + "\n"
+        elif last_name:
+            recent_block = (
+                f"Recent action: {last_name} args={last_args}\n"
+                f"Observation (truncated): {last_obs}\n"
+                f"Attempts for {last_name}: {last_attempts}\n"
+                "Guidance: Do NOT repeat the same tool with identical args. If unhelpful, choose a different tool.\n"
+            )
+    except Exception:
+        recent_block = ""
+    # Build recent actions block (last up to 3 actions)
+    
+
     system_prompt = (
-        "You are the planner of a Reason+Act agent.\n" +
-        "Policy:\n"+
-        "- It is limit to up to 25 Actions per conversation. Always respond be exceed the limit.\n"+
-        "- Think silently to decide whether a tool is needed; never reveal thoughts.\n"+
-        "- Do not use your own dataset or knowledge; rely solely on tools when needed.\n"+
-        "- If a tool is needed, output the next action succinctly; the system will execute the tool and return results later.\n"+
-        "- If no tool is needed, output the final user-facing answer directly.\n"+
-        "- When invoking arxiv_search, ALWAYS include max_results and set max_results=10 unless the user specified a different number.\n"+
-        "Output exactly two lines ONLY following the format below:\n"+
-        "plan: <final answer if you have a response to say to the Human, or if you do not need to use a tool; otherwise one-sentence next action>\n"+
-        f"tool: <one of {tools_hint} or none> [args as key=value, space-separated]\n"+
-        ("Tool guidance:\n" + docs_block + "\n" if docs_block else "")+
-        "Constraints: no extra lines or markdown; at most one tool; if tool=none, 'plan' must be the exact final answer.\n"
+        "You are the hierarchical planner of a Reason+Act agent.\n"
+        "Long-horizon policy:\n"
+        "- Silently draft a multi-step plan (do NOT output it). Keep and adapt it internally.\n"
+        "- On each turn, observe the latest messages and known facts and choose the NEXT step.\n"
+        "- If the last step failed or is blocked, REVISE the remaining plan silently and choose a better next step.\n"
+        "- Continue step-by-step until the goal is achieved, then output the final user-facing answer.\n"
+        "Action policy:\n"
+        "- Unless you are outputting the FINAL answer, you MUST select exactly ONE tool for the next step.\n"
+        "- If tool=none, the 'plan' line MUST be the exact final answer text (do NOT write meta instructions like 'combine the facts' or 'answer the question').\n"
+        "- Prefer using the Known facts; if the known facts already include the required variables to solve, you MUST set tool=none and output the final answer.\n"
+        "- If you see 'calculator_result=<number>' in Known facts, that IS the final calculation result; do NOT call calculator again.\n"
+        "- If you see 'web_search_result=<text>' in Known facts, that IS the search answer; do NOT call web_search again.\n"
+        "- You are encouraged to use web_search before using wiki_retrieve.\n"
+        "Output EXACTLY two lines (no extra text):\n"
+        "plan: <final answer if done, otherwise one-sentence next action>\n"
+        f"tool: <one of {tools_hint} or none> key=value, space-separated\n"
+        + ("STRICTLY follow the tool guidance and provide tool name followed by arguments ONLY:\n" + docs_block + "\n" if docs_block else "")
+        + "You are encouraged to set max_results more than 1 when using web_search, wiki_retrieve, arxiv_search tools.\n"
     )
-    prompt = f"{system_prompt}\n{user_context}\n"
+    prompt = f"{system_prompt}\n{facts_block}{recent_block}{user_context}\n"
 
     # Ollama client library usage (if available) with fallback to requests
     out_text = ""
@@ -246,22 +299,57 @@ def azure_sdk_planner(state: AgentState) -> AgentState:
     docs = state.get("tool_docs", {}) or {}
     docs_items = [f"- {k}: {v}".strip() for k, v in sorted(docs.items()) if k in tools and v]
     docs_block = "\n".join(docs_items) if docs_items else ""
+    # recent action context to discourage repetition
+    last_name = state.get("last_tool") or ""
+    last_args = state.get("last_tool_args") or {}
+    last_obs = (state.get("last_observation") or "")[:600]
+    attempts = state.get("tool_attempts") or {}
+    last_attempts = int(attempts.get(last_name, 0)) if last_name else 0
+
+    recent_block = ""
+    try:
+        history = state.get("action_history") or []
+        if history:
+            tail = history[-3:]
+            lines = ["Recent actions:"]
+            for i, rec in enumerate(tail, start=max(1, len(history)-len(tail)+1)):
+                t = rec.get("tool", "")
+                a = rec.get("args", {})
+                o = (rec.get("observation", "") or "")[:280]
+                lines.append(f"- #{i}: tool={t} args={a} obs={o}")
+            lines.append("Guidance: Do NOT restart completed subgoals; build on these observations.")
+            recent_block = "\n".join(lines) + "\n"
+        elif last_name:
+            recent_block = (
+                f"Recent action: {last_name} args={last_args}\n"
+                f"Observation (truncated): {last_obs}\n"
+                f"Attempts for {last_name}: {last_attempts}\n"
+                "Guidance: Do NOT repeat the same tool with identical args. If unhelpful, modify args (e.g., refine query) or choose a different tool.\n"
+            )
+    except Exception:
+        recent_block = ""
+
     sys_prompt = (
-        "You are the planner component of an agentic Reason+Act system.\n"
-        "Role: Observe the conversation history below, decide whether a tool is required, "
-        "and output either a final user-facing response or a single next tool action.\n"
+        "You are the hierarchical planner of an agentic Reason+Act system.\n"
+        "Long-horizon policy:\n"
+        "- Silently form a multi-step plan from the user's goal, keep it internal, and adapt after each observation.\n"
+        "- On each turn, pick the NEXT step only; if blocked, silently revise remaining steps and choose a better next one.\n"
+        "- Stop when the goal is accomplished and output the final user-facing answer.\n"
         "Behavioral rules:\n"
-        "- Do not use your own dataset or knowledge; rely solely on tools when needed.\n"
-        "- This is an agentic planner: perform deliberation internally (DO NOT reveal chain-of-thought).\n"
-        "- If a tool is required, produce a concise one-sentence plan that describes the next action, then a tool line.\n"
-        "- If no tool is required, produce the exact final answer to send to the user on the 'plan' line and set tool=none.\n"
-        "- Never output extra explanation, analysis, or markdown — only the two required lines in the exact format.\n"
-        "- When invoking arxiv_search, ALWAYS include max_results and set max_results=10 unless the user specified a different number.\n"
-        "Output format (exactly TWO lines):\n"
-        "plan: <final answer if no tool is needed OR a one-sentence next action if you want the system to call a tool>\n"
-        f"tool: <one of {tools_hint} or none> [args as key=value, space-separated]\n"
+        "- Unless you are outputting the FINAL answer, you MUST choose exactly ONE tool for the next step.\n"
+        "- If tool=none, the 'plan' line MUST be the exact final answer text (no meta like 'combine facts').\n"
+        "- Prefer using the Known facts (provided in the user message). If the known facts already include the required variables to solve, you MUST set tool=none and output the final answer.\n"
+        "- If you see 'calculator_result=<number>' in Known facts, that IS the final calculation result; do NOT call calculator again.\n"
+        "- If you see 'web_search_result=<text>' in Known facts, that IS the search answer; do NOT call web_search again.\n"
+        "Subgoal policy:\n"
+        "- Decompose into subgoals and complete them in order. E.g., (1) identify the entity; (2) get the attribute (capital).\n"
+        "- Do NOT proceed to later subgoals until prior ones are satisfied with credible evidence.\n"
+        "- You do NOT need to double check or confirm the result of the tool call, just use it as is.\n"
+        "Output format (EXACTLY TWO lines):\n"
+        "plan: <final answer if done OR a one-sentence next action>\n"
+        f"tool: <one of {tools_hint} or none> key=value, space-separated\n"
         + ("Tool guidance:\n" + docs_block + "\n" if docs_block else "")
-        + "Constraints: at most one tool; if tool=none then 'plan' must be the exact final reply to the user.\n"
+        + "Constraints: at most one tool; if tool=none then 'plan' MUST be the final user reply.\n"
     )
     try:
         client = AzureOpenAI(
@@ -269,11 +357,14 @@ def azure_sdk_planner(state: AgentState) -> AgentState:
             api_version=api_version,
             api_key=api_key,
         )
+        # Build user payload with optional facts
+        ft = state.get("facts_text") or ""
+        user_payload = (f"Known facts: {ft}\n{recent_block}{user_context}") if ft else f"{recent_block}{user_context}"
         response = client.chat.completions.create(
             model=deployment,  # deployment name
             messages=[
                 {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_context},
+                {"role": "user", "content": user_payload},
             ],
             temperature=0.0,
             max_tokens=4096,
@@ -281,7 +372,7 @@ def azure_sdk_planner(state: AgentState) -> AgentState:
         out_text = ""
         try:
             out_text = (response.choices[0].message.content or "") if response and response.choices else ""
-        except Exception:
+        except Exception as e:
             print("Azure planner response parsing failed ", e)
             out_text = ""
     except Exception:
@@ -294,7 +385,7 @@ def azure_sdk_planner(state: AgentState) -> AgentState:
                 },
                 json={"messages": [
                     {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_context},
+                    {"role": "user", "content": user_payload},
                 ],
                     "temperature": 0.0, "max_tokens": 256},
                 timeout=60
@@ -330,7 +421,7 @@ def select_planner(name: str) -> Callable[[AgentState], AgentState]:
     """Return a planner function by name.
 
     Args:
-        name: One of "ollama" or "azure" (case-insensitive).
+        name: One of "simple", "ollama", "azure_sdk" (also accepts alias "azure").
 
     Returns:
         A callable planner function.
@@ -344,7 +435,7 @@ def select_planner(name: str) -> Callable[[AgentState], AgentState]:
         return simple_planner
     if key == "ollama":
         return ollama_planner
-    if key == "azure_sdk":
+    if key in ("azure_sdk", "azure"):
         return azure_sdk_planner
     raise ValueError(f"Unsupported planner: {name}")
 
